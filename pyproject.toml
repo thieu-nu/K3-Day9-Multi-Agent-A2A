@@ -1,0 +1,43 @@
+[project]
+name = "olist-dispute-multi-agent"
+version = "0.1.0"
+description = "Multi-agent Olist e-commerce dispute resolution system"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "langgraph>=1.0,<2",
+    "polars>=1.35,<2",
+    "pydantic>=2.12,<3",
+    "python-dotenv>=1.1,<2",
+    "tenacity>=9,<10",
+    "together>=2.0,<3",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18,<2",
+    "pytest>=8.4,<10",
+    "pytest-asyncio>=1.2,<2",
+    "ruff>=0.14,<1",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true

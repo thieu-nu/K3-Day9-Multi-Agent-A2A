@@ -1,38 +1,79 @@
 # 1. Luồng hoạt động của các agent
 
-```text
-                    ┌───────────────────┐
-Customer case ─────▶│ Coordinator Agent │
-                    └─────────┬─────────┘
-                              │
-              ┌───────────────┼────────────────┐
-              │               │                │
-              ▼               ▼                ▼
-     ┌────────────────┐ ┌──────────────┐ ┌───────────────┐
-     │ Order & Seller │ │   Payment    │ │   Delivery    │
-     │     Agent      │ │    Agent     │ │     Agent     │
-     └────────┬───────┘ └──────┬───────┘ └───────┬───────┘
-              │                │                 │
-              └────────────────┼─────────────────┘
-                               ▼
-                     ┌──────────────────┐
-                     │  Evidence Bundle │
-                     └─────────┬────────┘
-                               ▼
-                     ┌──────────────────┐
-                     │   Policy Agent   │
-                     └─────────┬────────┘
-                               ▼
-                     ┌──────────────────┐
-                     │  Verifier Agent  │
-                     └─────────┬────────┘
-                               │
-                    PASS ──────┴────── FAIL
-                     │                  │
-                     ▼                  ▼
-               Write result      Return errors to
-                                  Coordinator
+```mermaid
+flowchart TD
+    INPUT["input/EC_NNN.json"] --> MAIN["main.py"]
+    MAIN --> COORD["Coordinator Agent<br/>LangGraph state machine"]
+
+    COORD -->|fan-out AgentTask| OS_WRAP["ApiGeneratedAgent<br/>Order & Seller"]
+    COORD -->|fan-out AgentTask| PAY_WRAP["ApiGeneratedAgent<br/>Payment"]
+    COORD -->|fan-out AgentTask| DEL_WRAP["ApiGeneratedAgent<br/>Delivery"]
+
+    subgraph DOMAIN["Ba domain agent chạy song song"]
+        OS_WRAP --> OS_TOOL["OrderSellerAgent<br/>CSV lookup + Decimal + timestamp"]
+        OS_TOOL <--> OS_DB[("Orders / Items / Sellers / Products")]
+        OS_TOOL -->|tool context| OS_LLM["Qwen3.5-9B API"]
+        OS_LLM -->|OrderSellerFacts JSON| OS_SCHEMA["Pydantic schema"]
+        OS_SCHEMA --> OS_RESULT["AgentResult: order_seller"]
+
+        PAY_WRAP --> PAY_TOOL["PaymentAgent<br/>aggregate + reconciliation"]
+        PAY_TOOL <--> PAY_DB[("Payments / Items")]
+        PAY_TOOL -->|tool context| PAY_LLM["Qwen3.5-9B API"]
+        PAY_LLM -->|PaymentFacts JSON| PAY_SCHEMA["Pydantic schema"]
+        PAY_SCHEMA --> PAY_RESULT["AgentResult: payment"]
+
+        DEL_WRAP --> DEL_TOOL["DeliveryAgent<br/>delivery + handoff comparison"]
+        DEL_TOOL <--> DEL_DB[("Orders / Items")]
+        DEL_TOOL -->|tool context| DEL_LLM["Qwen3.5-9B API"]
+        DEL_LLM -->|DeliveryFacts JSON| DEL_SCHEMA["Pydantic schema"]
+        DEL_SCHEMA --> DEL_RESULT["AgentResult: delivery"]
+    end
+
+    OS_RESULT --> COORD
+    PAY_RESULT --> COORD
+    DEL_RESULT --> COORD
+
+    COORD -->|identity + total checks| BUNDLE["EvidenceBundle<br/>version + SHA-256 digest"]
+    BUNDLE --> POLICY_WRAP["ApiGeneratedAgent<br/>Policy"]
+    POLICY_WRAP --> POLICY_TOOL["Python PolicyAgent<br/>áp dụng EC_POLICY_V1 theo priority"]
+    POLICY_TOOL -->|evaluated policy + locked rule fields| POLICY_LLM["Qwen3.5-9B Policy API"]
+    POLICY_LLM -->|PolicyDecision JSON| POLICY_SCHEMA["Pydantic PolicyDecision"]
+    POLICY_SCHEMA --> POLICY_RESULT["AgentResult: policy"]
+    POLICY_RESULT --> COORD
+
+    COORD -->|build from PolicyDecision| DRAFT["FinalOutput draft<br/>version + SHA-256 digest"]
+    DRAFT --> VERIFY_WRAP["ApiGeneratedAgent<br/>Verifier"]
+    VERIFY_WRAP --> VERIFY_TOOL["VerifierAgent tool<br/>independent CSV + contract checks"]
+    VERIFY_TOOL <--> VERIFY_DB[("Orders / Items / Payments / Sellers")]
+    VERIFY_TOOL -->|tool context + full lineage| VERIFY_LLM["Qwen3.5-9B API"]
+    VERIFY_LLM -->|VerificationResult JSON| VERIFY_SCHEMA["Pydantic VerificationResult"]
+    VERIFY_SCHEMA --> VERIFY_RESULT["AgentResult: verifier"]
+    VERIFY_RESULT --> COORD
+
+    COORD -->|PASS for current draft digest| OUTPUT["Atomic write<br/>output/EC_NNN.json"]
+    COORD -->|FAIL + retry_target| RETRY["Retry owner agent<br/>bounded attempts"]
+    RETRY --> COORD
+
+    COORD -. audit events .-> TRACE["logging/trace.jsonl"]
+    MAIN -. completed batch .-> META["logging/metadata.json"]
 ```
+
+Quy ước của luồng thực tế:
+
+1. `main.py` chỉ đọc case, khởi tạo các agent và bắt đầu từng workflow; không phân tích domain.
+2. Coordinator sở hữu state machine, tạo `AgentTask`, fan-out ba domain agent và kiểm tra mọi handoff.
+3. Khi chạy `--use-api`, mỗi logical agent là một `ApiGeneratedAgent`: tool runner đọc/tính dữ liệu trước,
+   Qwen sinh structured result, Pydantic validate, rồi chính JSON của Qwen trở thành `AgentResult`.
+4. Tool context không được ghi thẳng thành output agent trong chế độ API-generated.
+5. Coordinator gộp ba domain result thành EvidenceBundle. Trong Policy Agent, Python áp dụng bảng rule
+   `EC_POLICY_V1` trước; chỉ sau khi có kết quả hợp lệ mới gọi Qwen bằng evaluated policy làm context.
+   Qwen được đánh giá confidence và chọn entity/evidence hợp lệ nhưng không được đổi priority, issue,
+   status, cause, responsible party, refund, action hoặc bundle identity. Vi phạm trả
+   `POLICY_API_MISMATCH` và được retry có giới hạn.
+6. Policy Agent không gọi Verifier trực tiếp. Policy trả về Coordinator; Coordinator dựng draft và gọi Verifier.
+7. Verifier đọc lại dữ liệu cần thiết, kiểm tra độc lập và trả `PASS` hoặc `FAIL` về Coordinator.
+8. Chỉ Coordinator được ghi output, và chỉ ghi khi PASS khớp đúng `draft_version` cùng `draft_digest` hiện tại.
+9. FAIL được trả về agent sở hữu qua `retry_target`; retry có giới hạn, không có vòng lặp vô hạn.
 
 # 2. Cấu trúc thư mục
 
@@ -67,7 +108,11 @@ project/
 │   └── metadata.json
 │
 ├── agents/
+│   ├── __init__.py
+│   ├── api_runner.py
+│   ├── base.py
 │   ├── coordinator.py
+│   ├── domain_utils.py
 │   ├── order_seller_agent.py
 │   ├── payment_agent.py
 │   ├── delivery_agent.py
@@ -75,11 +120,22 @@ project/
 │   └── verifier_agent.py
 │
 ├── utils/
-│   └── data_loader.py
+│   ├── __init__.py
+│   ├── data_loader.py
+│   └── llm_client.py                       # Together/Qwen structured-output client
 │
+├── tests/
+│   ├── test_agents.py
+│   └── test_coordinator.py
+│
+├── .env.example
+├── .python-version
 ├── architecture.md
+├── howtorun.md
 ├── individual_5SoCuoiMHV_HoVaTen.md
+├── pyproject.toml
 ├── README.md
+├── uv.lock
 └── main.py
 ```
 
@@ -198,6 +254,8 @@ Mọi yêu cầu Coordinator gửi đến agent dùng envelope sau:
   "contract_version": "1.0",
   "run_id": "<run-id>",
   "correlation_id": "<correlation-id>",
+  "task_id": "<task-id>",
+  "attempt": 1,
   "case_id": "EC_001",
   "order_id": "<olist-order-id>",
   "policy_version": "EC_POLICY_V1",
@@ -211,6 +269,8 @@ Mọi yêu cầu Coordinator gửi đến agent dùng envelope sau:
 | `contract_version` | string | Có | Agent từ chối version không hỗ trợ |
 | `run_id` | string | Có | Không đổi trong batch |
 | `correlation_id` | string | Có | Duy nhất theo case/run |
+| `task_id` | string | Có | Duy nhất cho một lần gọi agent |
+| `attempt` | integer | Có | Bắt đầu từ 1, tăng khi retry |
 | `case_id` | string | Có | Khớp input và filename |
 | `order_id` | string | Có | Khớp claimed order, không rỗng |
 | `policy_version` | string | Có | Chỉ chấp nhận `EC_POLICY_V1` |
@@ -224,8 +284,11 @@ Mọi yêu cầu Coordinator gửi đến agent dùng envelope sau:
   "contract_version": "1.0",
   "run_id": "<run-id>",
   "correlation_id": "<correlation-id>",
+  "task_id": "<task-id>",
+  "attempt": 1,
   "case_id": "EC_001",
   "order_id": "<olist-order-id>",
+  "policy_version": "EC_POLICY_V1",
   "agent_name": "<agent-name>",
   "status": "success",
   "facts": {},
@@ -556,11 +619,19 @@ Mọi state có thể chuyển sang `FAILED`; không được nhảy từ `DISPA
 
 ```json
 {
+  "bundle_version": 1,
+  "bundle_digest": "<sha256-canonical-bundle>",
   "matched_rule_priority": 3,
   "primary_issue": "late_delivery_seller",
   "case_status": "action_required",
   "confidence": 1.0,
   "confidence_basis": ["critical_facts_complete", "rule_match_exact"],
+  "selected_entities": {
+    "order_ids": ["<order-id>"],
+    "item_ids": ["<order-id>:1"],
+    "seller_ids": ["<seller-id>"],
+    "payment_ids": ["<order-id>:1"]
+  },
   "ranked_causes": [
     {"cause_code": "SELLER_HANDOFF_AFTER_LIMIT", "rank": 1}
   ],
@@ -618,7 +689,8 @@ Mọi state có thể chuyển sang `FAILED`; không được nhảy từ `DISPA
   "evidence_bundle": {},
   "policy_decision": {},
   "draft_output": {},
-  "draft_version": 1
+  "draft_version": 1,
+  "draft_digest": "<sha256-canonical-draft>"
 }
 ```
 
@@ -628,6 +700,7 @@ Mọi state có thể chuyển sang `FAILED`; không được nhảy từ `DISPA
 {
   "verdict": "PASS",
   "draft_version": 1,
+  "draft_digest": "<sha256-canonical-draft>",
   "checks": {
     "schema": true,
     "identity": true,
@@ -648,7 +721,8 @@ Mọi state có thể chuyển sang `FAILED`; không được nhảy từ `DISPA
 }
 ```
 
-`verdict` chỉ là `PASS` hoặc `FAIL`. PASS áp dụng cho đúng `draft_version`; draft thay đổi phải verify lại.
+`verdict` chỉ là `PASS` hoặc `FAIL`. PASS chỉ áp dụng khi cả `draft_version` và `draft_digest`
+khớp draft hiện tại; draft thay đổi phải verify lại.
 
 # 9. EvidenceBundle và handoff
 
@@ -662,6 +736,8 @@ Mọi state có thể chuyển sang `FAILED`; không được nhảy từ `DISPA
   "case_id": "EC_001",
   "order_id": "<order-id>",
   "policy_version": "EC_POLICY_V1",
+  "bundle_version": 1,
+  "bundle_digest": "<sha256-canonical-bundle>",
   "source_status": {
     "order_seller": "success",
     "payment": "success",
@@ -682,8 +758,11 @@ Mọi state có thể chuyển sang `FAILED`; không được nhảy từ `DISPA
 }
 ```
 
-Coordinator chỉ tạo bundle khi ba source status là `success` hoặc khi một kết quả
-`not_applicable` được contract của rule ưu tiên cho phép. Bundle không chứa facts do Coordinator tự suy luận.
+Coordinator chỉ tạo bundle khi cả ba source status là `success`. Trạng thái nghiệp vụ `not_applicable`
+(ví dụ delivery không áp dụng cho order đã hủy) phải nằm trong facts của một AgentResult thành công,
+không phải là AgentStatus. Bundle không chứa facts do Coordinator tự suy luận.
+`bundle_digest` là SHA-256 của biểu diễn JSON canonical của toàn bộ bundle ngoại trừ chính trường digest.
+Policy Agent phải phản hồi đúng cả `bundle_version` và `bundle_digest`; mọi thay đổi domain tạo bundle version mới.
 
 ## 9.2. Trình tự handoff
 
@@ -830,8 +909,9 @@ Mỗi `input/EC_NNN.json` tương ứng đúng một `output/EC_NNN.json`. Final
 | `INTERNAL_ERROR` | Agent bất kỳ | Có điều kiện | Một lần; sau đó fail case |
 
 Mỗi agent tối đa một retry cho cùng `code` và cùng draft version. Mọi retry tạo event trace mới.
-Không lặp vô hạn. Một case fail không được ghi output một phần; toàn batch không đủ điều kiện đóng gói
-nếu không có đúng 50 PASS.
+Không lặp vô hạn. Một case fail không ghi output mới, nhưng runner không xóa artifact đã tồn tại hoặc output
+của case khác đã PASS. Toàn batch không đủ điều kiện đóng gói nếu trace/metadata của lượt hiện tại không có
+đúng 50 PASS; không được suy luận thành công chỉ từ số file đang có trong `output/`.
 
 # 14. Trace và metadata
 
@@ -874,9 +954,27 @@ Kế hoạch schema:
 Tên model phải được khai báo trong source và metadata, không đặt trong `.env`. Mọi model của từng agent
 phải có parameter size không lớn hơn 10B.
 
-# 15. Kế hoạch triển khai sau giai đoạn scaffold
+# 15. Nền tảng kỹ thuật và model
 
-Giai đoạn hiện tại dừng ở tài liệu và file placeholder. Các bước sau chưa được code:
+- Python `3.12`, quản lý runtime/dependency bằng `uv` và khóa phiên bản trong `uv.lock`.
+- Điều phối workflow bằng `LangGraph`; contract và structured output bằng `Pydantic`.
+- Đọc, lọc và aggregate CSV bằng `Polars`; retry lỗi tạm thời bằng `Tenacity`.
+- Provider mặc định: Together AI, gọi qua SDK `together`.
+- Model cố định cho mọi agent API: `Qwen/Qwen3.5-9B`, quy mô 9B, không vượt giới hạn 10B.
+- LLM chỉ trả JSON Schema có kiểm tra; phép tính, so sánh, identity, digest và ghi file vẫn là code xác định.
+- Secret duy nhất là `TOGETHER_API_KEY` trong `.env`; `.env` không được commit hoặc ghi vào trace.
+- Có thể thay provider bằng OpenAI-compatible endpoint chạy vLLM/SGLang sau này, nhưng model ID,
+  schema và giới hạn tham số phải giữ trong cấu hình source có kiểm soát.
+
+Tài liệu chuẩn: [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B),
+[Together structured outputs](https://docs.together.ai/docs/inference/chat/structured-outputs),
+[LangGraph Graph API](https://docs.langchain.com/oss/python/langgraph/graph-api),
+[Polars](https://docs.pola.rs/user-guide/installation/).
+
+# 16. Kế hoạch triển khai
+
+Các giai đoạn là gate nghiệm thu độc lập. Data Loader, toàn bộ agent, Coordinator, Verifier và batch runner
+đã được triển khai; danh sách dưới đây được giữ làm trình tự kiểm tra và bảo trì.
 
 ## Giai đoạn 1 - Khóa contract và policy
 
@@ -927,7 +1025,7 @@ Giai đoạn hiện tại dừng ở tài liệu và file placeholder. Các bư�
 - Kiểm tra zip có đúng 50 entry ở root và mỗi entry parse được.
 - Commit toàn bộ source trước khi nộp theo README.
 
-# 16. Checklist nghiệm thu
+# 17. Checklist nghiệm thu
 
 ## Kiến trúc
 
