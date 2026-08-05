@@ -1,0 +1,58 @@
+{
+  "run_id": "run-20260805T101353Z-f5c1f6d4",
+  "generated_at": "2026-08-05T10:38:23.766265+00:00",
+  "policy_version": "EC_POLICY_V1",
+  "framework": "langgraph 1.2.10",
+  "runtime": "Python 3.12.13",
+  "libraries": {
+    "polars": "1.43.2",
+    "pydantic": "2.13.4",
+    "together": "2.28.0"
+  },
+  "agent_execution": {
+    "mode": "qwen_api_generated",
+    "order_seller": "qwen_api_generated_from_csv",
+    "payment": "qwen_api_generated_from_csv",
+    "delivery": "qwen_api_generated_from_csv",
+    "policy": "qwen_api_generated_decision",
+    "verifier": "qwen_api_generated_verification"
+  },
+  "models": [
+    {
+      "agent": "order_seller",
+      "model": "Qwen/Qwen3.5-9B",
+      "parameter_size": "9B"
+    },
+    {
+      "agent": "payment",
+      "model": "Qwen/Qwen3.5-9B",
+      "parameter_size": "9B"
+    },
+    {
+      "agent": "delivery",
+      "model": "Qwen/Qwen3.5-9B",
+      "parameter_size": "9B"
+    },
+    {
+      "agent": "policy",
+      "model": "Qwen/Qwen3.5-9B",
+      "parameter_size": "9B"
+    },
+    {
+      "agent": "verifier",
+      "model": "Qwen/Qwen3.5-9B",
+      "parameter_size": "9B"
+    }
+  ],
+  "api_model": {
+    "provider": "together",
+    "model": "Qwen/Qwen3.5-9B",
+    "parameter_size_b": 9.0,
+    "usage": "structured agent result generation for every successful tool handoff"
+  },
+  "input_count": 50,
+  "passed_count": 50,
+  "output_count": 50,
+  "source_revision": "8344611eec202393f159093b2e9bf054d614cc8c",
+  "case_filter": null
+}

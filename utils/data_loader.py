@@ -1,70 +1,113 @@
-import csv
-import os
-from typing import List, Dict, Any, Optional
+from __future__ import annotations
+
+from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
 
+import polars as pl
+
+
+class DataIntegrityError(RuntimeError):
+    """Raised when the CSV database violates an identity invariant."""
+
+
+Row = dict[str, str | None]
+
+
 class OlistDataLoader:
-    """
-    Lớp tải và truy xuất dữ liệu từ các file CSV của Olist.
-    Đảm bảo 100% chỉ đọc, không chỉnh sửa hay can thiệp dữ liệu gốc,
-    giữ nguyên mọi định danh và giá trị dưới dạng string (chuỗi).
-    """
-    def __init__(self, data_dir: str | Path = "data"):
-        self.data_dir = str(data_dir)
-        self._payments_cache: Optional[Dict[str, List[Dict[str, str]]]] = None
-        self._items_cache: Optional[Dict[str, List[Dict[str, str]]]] = None
+    """Read-only, in-memory indexes over the CSV tables used by the agents."""
 
-    def _load_payments_if_needed(self) -> None:
-        if self._payments_cache is not None:
-            return
-        
-        self._payments_cache = {}
-        file_path = os.path.join(self.data_dir, "olist_order_payments_dataset.csv")
-        if not os.path.exists(file_path):
-            return
+    ORDER_COLUMNS = (
+        "order_id",
+        "customer_id",
+        "order_status",
+        "order_purchase_timestamp",
+        "order_approved_at",
+        "order_delivered_carrier_date",
+        "order_delivered_customer_date",
+        "order_estimated_delivery_date",
+    )
+    ITEM_COLUMNS = (
+        "order_id",
+        "order_item_id",
+        "product_id",
+        "seller_id",
+        "shipping_limit_date",
+        "price",
+        "freight_value",
+    )
+    PAYMENT_COLUMNS = (
+        "order_id",
+        "payment_sequential",
+        "payment_type",
+        "payment_installments",
+        "payment_value",
+    )
 
-        with open(file_path, mode="r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                order_id = str(row.get("order_id", "")).strip()
-                if order_id not in self._payments_cache:
-                    self._payments_cache[order_id] = []
-                self._payments_cache[order_id].append(dict(row))
+    def __init__(self, data_directory: str | Path) -> None:
+        self.data_directory = Path(data_directory)
+        if not self.data_directory.is_dir():
+            raise FileNotFoundError(f"data directory does not exist: {self.data_directory}")
 
-    def _load_items_if_needed(self) -> None:
-        if self._items_cache is not None:
-            return
-        
-        self._items_cache = {}
-        file_path = os.path.join(self.data_dir, "olist_order_items_dataset.csv")
-        if not os.path.exists(file_path):
-            return
+        self._orders = self._group_rows(
+            self._read_strings("olist_orders_dataset.csv", self.ORDER_COLUMNS), "order_id"
+        )
+        self._items = self._group_rows(
+            self._read_strings("olist_order_items_dataset.csv", self.ITEM_COLUMNS), "order_id"
+        )
+        self._payments = self._group_rows(
+            self._read_strings("olist_order_payments_dataset.csv", self.PAYMENT_COLUMNS),
+            "order_id",
+        )
+        self._seller_ids = self._read_key_set("olist_sellers_dataset.csv", "seller_id")
+        self._product_ids = self._read_key_set("olist_products_dataset.csv", "product_id")
 
-        with open(file_path, mode="r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                order_id = str(row.get("order_id", "")).strip()
-                if order_id not in self._items_cache:
-                    self._items_cache[order_id] = []
-                self._items_cache[order_id].append(dict(row))
+    def get_order(self, order_id: str) -> Row | None:
+        rows = self._orders.get(order_id, ())
+        if len(rows) > 1:
+            raise DataIntegrityError(f"duplicate order_id in orders: {order_id}")
+        return dict(rows[0]) if rows else None
 
-    def get_order_payments(self, order_id: str) -> List[Dict[str, str]]:
-        """
-        Trả về danh sách các bản ghi thanh toán theo order_id.
-        Nếu không có bản ghi nào, trả về danh sách rỗng [].
-        """
-        self._load_payments_if_needed()
-        if not self._payments_cache:
-            return []
-        # Trả về danh sách copy nhẹ để tránh caller vô tình chỉnh sửa bộ nhớ cache
-        return [dict(row) for row in self._payments_cache.get(str(order_id).strip(), [])]
+    def get_items(self, order_id: str) -> list[Row]:
+        return [dict(row) for row in self._items.get(order_id, ())]
 
-    def get_order_items(self, order_id: str) -> List[Dict[str, str]]:
-        """
-        Trả về danh sách các bản ghi sản phẩm (items) thuộc order_id.
-        Nếu không có bản ghi nào, trả về danh sách rỗng [].
-        """
-        self._load_items_if_needed()
-        if not self._items_cache:
-            return []
-        return [dict(row) for row in self._items_cache.get(str(order_id).strip(), [])]
+    def get_payments(self, order_id: str) -> list[Row]:
+        return [dict(row) for row in self._payments.get(order_id, ())]
+
+    def seller_exists(self, seller_id: str) -> bool:
+        return seller_id in self._seller_ids
+
+    def product_exists(self, product_id: str) -> bool:
+        return product_id in self._product_ids
+
+    def _read_strings(self, filename: str, columns: Iterable[str]) -> pl.DataFrame:
+        path = self.data_directory / filename
+        if not path.is_file():
+            raise FileNotFoundError(f"required database file does not exist: {path}")
+        selected = list(columns)
+        return pl.read_csv(
+            path,
+            columns=selected,
+            schema_overrides={column: pl.String for column in selected},
+            null_values="",
+        )
+
+    def _read_key_set(self, filename: str, key: str) -> frozenset[str]:
+        frame = self._read_strings(filename, (key,))
+        keys = [value for value in frame.get_column(key).to_list() if value]
+        if len(keys) != len(set(keys)):
+            raise DataIntegrityError(f"duplicate primary key in {filename}: {key}")
+        return frozenset(keys)
+
+    @staticmethod
+    def _group_rows(frame: pl.DataFrame, key: str) -> dict[str, tuple[Row, ...]]:
+        grouped: defaultdict[str, list[Row]] = defaultdict(list)
+        for raw_row in frame.iter_rows(named=True):
+            row: Row = {
+                name: value if isinstance(value, str) else None for name, value in raw_row.items()
+            }
+            identity = row.get(key)
+            if not identity:
+                raise DataIntegrityError(f"missing required key {key}")
+            grouped[identity].append(row)
+        return {identity: tuple(rows) for identity, rows in grouped.items()}
