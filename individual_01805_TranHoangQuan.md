@@ -4,22 +4,22 @@
 
 ## 1. Thông tin cá nhân
 
-| Thông tin       | Nội dung     |
-| --------------- | ------------ |
-| Họ và tên       | [Họ và tên]  |
-| MSSV            | [MSSV]       |
-| Khóa/Lớp        | [K3]         |
-| Vai trò chính   | [Vai trò]    |
-| Ngày hoàn thành | [YYYY-MM-DD] |
+| Thông tin       | Nội dung        |
+| --------------- | --------------- |
+| Họ và tên       | Trần Hoàng Quân |
+| MSSV            | 2A202601805     |
+| Khóa/Lớp        | [K3]            |
+| Vai trò chính   | [Vai trò]       |
+| Ngày hoàn thành | 2026-08-05      |
 
 ## 2. Vai trò và phạm vi công việc
 
 ### Phần việc sở hữu
 
-| Module/deliverable | File/hàm phụ trách | Input nhận vào | Output bàn giao   | Trạng thái                            |
-| ------------------ | ------------------ | -------------- | ----------------- | ------------------------------------- |
-| [Phần việc]        | [File/hàm]         | [Input]        | [Output/artifact] | [Hoàn thành/Một phần/Chưa hoàn thành] |
-| [Phần việc]        | [File/hàm]         | [Input]        | [Output/artifact] | [Hoàn thành/Một phần/Chưa hoàn thành] |
+| Module/deliverable | File/hàm phụ trách                | Input nhận vào | Output bàn giao   | Trạng thái                            |
+| ------------------ | --------------------------------- | -------------- | ----------------- | ------------------------------------- |
+| [Phần việc]        | Chốt các agent và luồng hoạt động | README.md      | architecture.md   | Hoàn thành                            |
+| [Phần việc]        | [File/hàm]                        | [Input]        | [Output/artifact] | [Hoàn thành/Một phần/Chưa hoàn thành] |
 
 Chỉ nhận ownership cho phần bạn trực tiếp thực hiện. Liên hệ rõ phần việc của bạn với đầu vào, đầu ra và các thành viên phụ thuộc vào phần đó.
 
