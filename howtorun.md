@@ -146,8 +146,9 @@ Quá trình chạy sẽ:
 3. Truncate `logging/trace.jsonl`.
 4. Chạy Order/Seller, Payment và Delivery Agent cho từng case.
 5. Python áp dụng bảng policy `EC_POLICY_V1` theo đúng priority trong README, sau đó mới gọi Policy Agent
-   Qwen. Rule/refund/action và bundle identity do Python khóa; Qwen đánh giá confidence và chọn
-   entity/evidence. Kết quả API sửa trường bị khóa sẽ trả `POLICY_API_MISMATCH` và retry có giới hạn.
+   Qwen. Rule/refund/action, entity/evidence selection và bundle identity do Python khóa. Confidence
+   mặc định của Python bị loại khỏi API context; Qwen phải tự trả `confidence` và `confidence_basis`.
+   Kết quả API sửa trường bị khóa sẽ trả `POLICY_API_MISMATCH` và retry có giới hạn.
 6. Tạo draft và chuyển sang Verifier Agent.
 6. Chỉ ghi output khi Verifier trả `PASS`.
 7. Ghi metadata của lượt chạy mới vào `logging/metadata.json`.

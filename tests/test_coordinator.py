@@ -348,6 +348,31 @@ async def test_happy_path_fans_out_and_writes_only_after_pass(
     assert output["financial_resolution"]["recommended_refund_brl"] == 15.0
     event_types = [event["event_type"] for event in trace.events]
     assert event_types.index("verification_completed") < event_types.index("output_written")
+    assert all(event["input_refs"] for event in trace.events)
+
+    received = next(event for event in trace.events if event["event_type"] == "case_received")
+    assert received["input_refs"] == {
+        "source_filename": "EC_001.json",
+        "input_case_id": "EC_001",
+        "order_id": case_input["customer_request"]["claimed_order_id"],
+    }
+    completed = next(event for event in trace.events if event["event_type"] == "agent_completed")
+    assert completed["input_refs"]["task_id"]
+    assert completed["input_refs"]["payload_digest"]
+    assert completed["input_refs"]["attempt"] == 1
+
+    policy_decided = next(
+        event for event in trace.events if event["event_type"] == "policy_decided"
+    )
+    assert len(policy_decided["input_refs"]["domain_tasks"]) == 3
+    assert policy_decided["input_refs"]["evidence_bundle"]["digest"]
+    assert policy_decided["input_refs"]["policy_task"]["task_id"]
+
+    verified = next(
+        event for event in trace.events if event["event_type"] == "verification_completed"
+    )
+    assert verified["input_refs"]["task_id"]
+    assert verified["input_refs"]["draft_digest"]
 
 
 @pytest.mark.asyncio

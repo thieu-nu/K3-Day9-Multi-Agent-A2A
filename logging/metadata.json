@@ -1,6 +1,6 @@
 {
-  "run_id": "run-20260805T060232Z-fa91616d",
-  "generated_at": "2026-08-05T06:02:56.119732+00:00",
+  "run_id": "run-20260805T101353Z-f5c1f6d4",
+  "generated_at": "2026-08-05T10:38:23.766265+00:00",
   "policy_version": "EC_POLICY_V1",
   "framework": "langgraph 1.2.10",
   "runtime": "Python 3.12.13",
@@ -50,9 +50,9 @@
     "parameter_size_b": 9.0,
     "usage": "structured agent result generation for every successful tool handoff"
   },
-  "input_count": 1,
-  "passed_count": 1,
-  "output_count": 1,
-  "source_revision": "51388fe1d8b2dd3478fcce9b85d2fbaf1fdf59cd",
-  "case_filter": "EC_050"
+  "input_count": 50,
+  "passed_count": 50,
+  "output_count": 50,
+  "source_revision": "8344611eec202393f159093b2e9bf054d614cc8c",
+  "case_filter": null
 }

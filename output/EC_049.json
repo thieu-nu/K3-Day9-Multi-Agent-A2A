@@ -3,10 +3,12 @@
   "assessment": {
     "primary_issue": "late_delivery_logistics",
     "case_status": "action_required",
-    "confidence": 1.0
+    "confidence": 0.95
   },
   "affected_entities": {
-    "order_ids": [],
+    "order_ids": [
+      "5b9e9502eca103a28ea22a94c65e3950"
+    ],
     "item_ids": [
       "5b9e9502eca103a28ea22a94c65e3950:1"
     ],

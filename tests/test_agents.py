@@ -7,6 +7,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 from agents.api_runner import ApiGeneratedAgent
 from agents.base import success_result
@@ -16,6 +17,7 @@ from agents.coordinator import (
     AgentTask,
     AtomicJsonOutputStore,
     CoordinatorAgent,
+    PolicyDecision,
 )
 from agents.delivery_agent import DeliveryAgent
 from agents.order_seller_agent import OrderSellerAgent
@@ -92,6 +94,11 @@ async def test_real_agents_cover_every_policy_branch(
     assert result.final_output is not None
     assert result.final_output.assessment.primary_issue.value == expected_issue
     assert result.handoffs["verifier"] == "PASS"
+    if case_id == "EC_005":
+        assert result.final_output.affected_entities.item_ids == []
+        assert result.final_output.affected_entities.seller_ids == []
+        assert result.final_output.financial_resolution.item_total_brl == 0.0
+        assert result.final_output.financial_resolution.freight_total_brl == 0.0
 
 
 def test_domain_agents_reconcile_real_order(olist_data: OlistDataLoader) -> None:
@@ -230,26 +237,42 @@ class RecordingPolicyRunner:
 
 
 class RecordingPolicyClient:
-    def __init__(self, events: list[str], *, change_locked_rule: bool = False) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        change_locked_rule: bool = False,
+        omit_selected_ids: bool = False,
+    ) -> None:
         self.events = events
         self.change_locked_rule = change_locked_rule
+        self.omit_selected_ids = omit_selected_ids
 
     async def complete_structured(self, **kwargs: Any) -> Any:
         self.events.append("policy_api")
         request = json.loads(kwargs["user_prompt"])
         tool_result = request["source"]["tool_result"]
         facts = dict(tool_result["facts"])
+        assert "confidence" not in facts
+        assert "confidence_basis" not in facts
         facts["confidence"] = 0.73
         facts["confidence_basis"] = ["api_reviewed_python_policy"]
         if self.change_locked_rule:
             facts["resolution_actions"] = ["explain_valid_split_payment"]
+        if self.omit_selected_ids:
+            facts["selected_entities"] = {
+                **facts["selected_entities"],
+                "order_ids": [],
+            }
         response = {
             "agent_name": request["agent_name"],
             "task_id": request["task_id"],
             "source_digest": request["source_digest"],
             "facts": facts,
-            "entity_candidates": tool_result["entity_candidates"],
-            "evidence_candidates": tool_result["evidence_candidates"],
+            # Real policy responses may mirror selected facts at the top level. Those fields do
+            # not feed the bundle; only facts.selected_* is authoritative for Policy.
+            "entity_candidates": facts["selected_entities"],
+            "evidence_candidates": facts["selected_evidence_ids"],
             "warnings": [],
         }
         return kwargs["response_model"].model_validate_json(json.dumps(response))
@@ -304,3 +327,83 @@ async def test_policy_api_cannot_override_python_rule() -> None:
     assert result.status == AgentStatus.CONFLICT
     assert result.errors[0].code == "POLICY_API_MISMATCH"
     assert "resolution_actions" in result.errors[0].path
+
+
+@pytest.mark.asyncio
+async def test_policy_api_cannot_omit_python_selected_ids() -> None:
+    events: list[str] = []
+    task = task_for(
+        "EC_002",
+        "e2a03ccf5ea816036608b2d8c3ab8e60",
+        {"policy_version": "EC_POLICY_V1"},
+    )
+    agent = ApiGeneratedAgent(
+        agent_name=AgentName.POLICY,
+        tool_runner=RecordingPolicyRunner(events),
+        client=cast(
+            TogetherStructuredClient,
+            RecordingPolicyClient(events, omit_selected_ids=True),
+        ),
+    )
+
+    result = await agent.run(task)
+
+    assert events == ["python_policy", "policy_api"]
+    assert result.status == AgentStatus.CONFLICT
+    assert result.errors[0].code == "POLICY_API_MISMATCH"
+    assert "selected_entities" in result.errors[0].path
+
+
+class OmitEntityCandidatesClient(FakeGeneratingClient):
+    async def complete_structured(self, **kwargs: Any) -> Any:
+        generated = await super().complete_structured(**kwargs)
+        return generated.model_copy(
+            update={
+                "entity_candidates": generated.entity_candidates.model_copy(
+                    update={"payment_ids": []}
+                )
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_domain_api_cannot_omit_tool_entity_candidates(
+    olist_data: OlistDataLoader,
+) -> None:
+    case = load_case("EC_001")
+    request = case["customer_request"]
+    assert isinstance(request, dict)
+    order_id = request["claimed_order_id"]
+    assert isinstance(order_id, str)
+    agent = ApiGeneratedAgent(
+        agent_name=AgentName.PAYMENT,
+        tool_runner=PaymentAgent(olist_data),
+        client=cast(TogetherStructuredClient, OmitEntityCandidatesClient()),
+    )
+
+    result = await agent.run(
+        task_for(
+            "EC_001",
+            order_id,
+            {"lookup_order_id": order_id, "reconciliation_tolerance_brl": 0.10},
+        )
+    )
+
+    assert result.status == AgentStatus.CONFLICT
+    assert result.errors[0].code == "AGENT_API_CONTEXT_MISMATCH"
+    assert result.errors[0].path == "entity_candidates"
+
+
+def test_policy_case_status_requires_matching_refund_and_actions() -> None:
+    task = task_for(
+        "EC_002",
+        "e2a03ccf5ea816036608b2d8c3ab8e60",
+        {"policy_version": "EC_POLICY_V1"},
+    )
+    facts = RecordingPolicyRunner([]).run(task).facts
+
+    with pytest.raises(ValidationError, match="no_action requires zero refund"):
+        PolicyDecision.model_validate({**facts, "recommended_refund_brl": 1.0})
+
+    with pytest.raises(ValidationError, match="explanation/rejection actions only"):
+        PolicyDecision.model_validate({**facts, "resolution_actions": ["issue_full_refund"]})

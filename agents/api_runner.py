@@ -36,6 +36,13 @@ class ApiEntityCandidates(ApiModel):
     payment_ids: list[Identifier] = Field(max_length=20)
 
 
+class ApiSelectedEntities(ApiModel):
+    order_ids: list[Identifier] = Field(max_length=5)
+    item_ids: list[Identifier] = Field(max_length=5)
+    seller_ids: list[Identifier] = Field(max_length=5)
+    payment_ids: list[Identifier] = Field(max_length=5)
+
+
 class OrderRecord(ApiModel):
     order_id: str
     customer_id: str
@@ -143,7 +150,7 @@ class PolicyDecisionApi(ApiModel):
     case_status: Literal["action_required", "no_action"]
     confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
     confidence_basis: list[str]
-    selected_entities: EntityCandidates
+    selected_entities: ApiSelectedEntities
     ranked_causes: list[ApiRankedCause] = Field(min_length=1, max_length=3)
     responsible_parties: list[ApiResponsibleParty] = Field(max_length=3)
     recommended_refund_brl: float = Field(ge=0, allow_inf_nan=False)
@@ -266,9 +273,15 @@ class ApiGeneratedAgent:
         if tool_result.status.value != "success":
             return tool_result
 
+        tool_context = tool_result.model_dump(mode="json")
+        if self._agent_name == AgentName.POLICY:
+            policy_facts = dict(tool_context["facts"])
+            policy_facts.pop("confidence", None)
+            policy_facts.pop("confidence_basis", None)
+            tool_context["facts"] = policy_facts
         source = {
             "task": task.model_dump(mode="json"),
-            "tool_result": tool_result.model_dump(mode="json"),
+            "tool_result": tool_context,
         }
         source_digest = self._digest(source)
         api_facts_model = API_FACT_MODELS[self._agent_name]
@@ -284,11 +297,16 @@ class ApiGeneratedAgent:
                 "EC_POLICY_V1 table. You MUST preserve bundle_version, bundle_digest, "
                 "matched_rule_priority, primary_issue, case_status, ranked_causes, "
                 "responsible_parties, recommended_refund_brl, resolution_actions, and "
-                "excluded_higher_priority_rules exactly. The policy agent may independently assess "
-                "confidence and select only entities/evidence present in the tool context. For all "
-                "other agents, preserve tool facts exactly. Your response, not the tool_result "
-                "object, will be handed to the Coordinator. Do not add explanations. Copy "
-                "agent_name, task_id, and source_digest exactly."
+                "excluded_higher_priority_rules exactly. You MUST also preserve selected_entities "
+                "and selected_evidence_ids exactly; never replace a populated ID list with an "
+                "empty list. The policy agent may independently assess only confidence and "
+                "confidence_basis. No Python confidence value is supplied: estimate confidence "
+                "yourself from evidence completeness, consistency across sources, and certainty of "
+                "the matched rule. Do not default to 1.0. For every agent, copy entity_candidates "
+                "and evidence_candidates exactly from tool_result. For all other agents, preserve "
+                "tool facts exactly. Your response, not the tool_result object, will be handed to "
+                "the Coordinator. Do not add explanations. Copy agent_name, task_id, and "
+                "source_digest exactly."
             ),
             user_prompt=json.dumps(
                 {
@@ -316,37 +334,32 @@ class ApiGeneratedAgent:
             mode="json", by_alias=True
         )
         validated_facts = result_facts_model.model_validate(api_facts).model_dump(mode="json")
+        context_mismatches = self._context_mismatches(tool_result, generated)
+        if context_mismatches:
+            return self._mismatch_result(
+                task,
+                code="AGENT_API_CONTEXT_MISMATCH",
+                mismatches=context_mismatches,
+                message="agent API omitted or changed IDs supplied by the Python tool context",
+            )
         policy_mismatches = self._policy_mismatches(tool_result.facts, validated_facts)
         if policy_mismatches:
-            return AgentResult(
-                contract_version=task.contract_version,
-                run_id=task.run_id,
-                correlation_id=task.correlation_id,
-                task_id=task.task_id,
-                attempt=task.attempt,
-                case_id=task.case_id,
-                order_id=task.order_id,
-                policy_version=task.policy_version,
-                agent_name=self._agent_name,
-                status=AgentStatus.CONFLICT,
-                errors=[
-                    AgentError(
-                        code="POLICY_API_MISMATCH",
-                        path=",".join(policy_mismatches),
-                        message=(
-                            "policy API changed fields locked by the Python EC_POLICY_V1 evaluation"
-                        ),
-                        source=AgentName.POLICY.value,
-                        retryable=True,
-                        retry_target=AgentName.POLICY,
-                    )
-                ],
+            return self._mismatch_result(
+                task,
+                code="POLICY_API_MISMATCH",
+                mismatches=policy_mismatches,
+                message="policy API changed fields locked by the Python EC_POLICY_V1 evaluation",
             )
         api_warning = {
             "type": "api_generation",
             "provider": QWEN_PROVIDER,
             "model": QWEN_MODEL,
             "source_digest": source_digest,
+            **(
+                {"confidence_source": "qwen_api_self_assessment"}
+                if self._agent_name == AgentName.POLICY
+                else {}
+            ),
         }
         return AgentResult(
             contract_version=task.contract_version,
@@ -400,6 +413,8 @@ class ApiGeneratedAgent:
             "responsible_parties",
             "recommended_refund_brl",
             "resolution_actions",
+            "selected_entities",
+            "selected_evidence_ids",
             "excluded_higher_priority_rules",
         )
         return [
@@ -408,6 +423,57 @@ class ApiGeneratedAgent:
             if self._canonical(normalized_evaluation.get(field))
             != self._canonical(generated_facts.get(field))
         ]
+
+    def _context_mismatches(
+        self,
+        tool_result: AgentResult,
+        generated: ApiGeneratedResponse[Any],
+    ) -> list[str]:
+        if self._agent_name not in {
+            AgentName.ORDER_SELLER,
+            AgentName.PAYMENT,
+            AgentName.DELIVERY,
+        }:
+            return []
+        mismatches: list[str] = []
+        if self._canonical(generated.entity_candidates.model_dump(mode="json")) != self._canonical(
+            tool_result.entity_candidates.model_dump(mode="json")
+        ):
+            mismatches.append("entity_candidates")
+        if generated.evidence_candidates != tool_result.evidence_candidates:
+            mismatches.append("evidence_candidates")
+        return mismatches
+
+    def _mismatch_result(
+        self,
+        task: AgentTask,
+        *,
+        code: str,
+        mismatches: list[str],
+        message: str,
+    ) -> AgentResult:
+        return AgentResult(
+            contract_version=task.contract_version,
+            run_id=task.run_id,
+            correlation_id=task.correlation_id,
+            task_id=task.task_id,
+            attempt=task.attempt,
+            case_id=task.case_id,
+            order_id=task.order_id,
+            policy_version=task.policy_version,
+            agent_name=self._agent_name,
+            status=AgentStatus.CONFLICT,
+            errors=[
+                AgentError(
+                    code=code,
+                    path=",".join(mismatches),
+                    message=message,
+                    source=self._agent_name.value,
+                    retryable=True,
+                    retry_target=self._agent_name,
+                )
+            ],
+        )
 
     @staticmethod
     def _canonical(value: object) -> str:

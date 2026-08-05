@@ -67,8 +67,9 @@ Quy ước của luồng thực tế:
 4. Tool context không được ghi thẳng thành output agent trong chế độ API-generated.
 5. Coordinator gộp ba domain result thành EvidenceBundle. Trong Policy Agent, Python áp dụng bảng rule
    `EC_POLICY_V1` trước; chỉ sau khi có kết quả hợp lệ mới gọi Qwen bằng evaluated policy làm context.
-   Qwen được đánh giá confidence và chọn entity/evidence hợp lệ nhưng không được đổi priority, issue,
-   status, cause, responsible party, refund, action hoặc bundle identity. Vi phạm trả
+   Context gửi Qwen loại bỏ confidence mặc định của Python. Qwen tự đánh giá `confidence` và
+   `confidence_basis`; không được đổi priority, issue, status, cause, responsible party, refund,
+   action, entity/evidence selection hoặc bundle identity. Vi phạm trả
    `POLICY_API_MISMATCH` và được retry có giới hạn.
 6. Policy Agent không gọi Verifier trực tiếp. Policy trả về Coordinator; Coordinator dựng draft và gọi Verifier.
 7. Verifier đọc lại dữ liệu cần thiết, kiểm tra độc lập và trả `PASS` hoặc `FAIL` về Coordinator.
@@ -878,7 +879,10 @@ Mỗi `input/EC_NNN.json` tương ứng đúng một `output/EC_NNN.json`. Final
 ## 12.1. Enum và invariant
 
 - `primary_issue`: đúng một trong sáu issue của bảng policy.
-- `case_status`: `action_required` khi refund > 0, ngược lại `no_action`.
+- `case_status=action_required`: refund phải lớn hơn 0 và action chỉ thuộc nhóm hoàn tiền
+  (`issue_full_refund`, `refund_freight`).
+- `case_status=no_action`: refund phải bằng 0 và action chỉ thuộc nhóm giải thích/bác bỏ
+  (`explain_valid_split_payment`, `reject_late_refund`).
 - `confidence`: số trong `[0,1]`.
 - `currency`: luôn là `BRL`.
 - Bốn giá trị tiền không âm, hữu hạn và có độ chính xác 2 chữ số.
@@ -923,6 +927,11 @@ của case khác đã PASS. Toàn batch không đủ điều kiện đóng gói 
   `status`, `input_refs`, `output_summary`, `handoff_to`, `duration_ms`, `errors`.
 - Event tối thiểu: `case_received`, `task_dispatched`, `agent_completed`, `handoff_sent`,
   `policy_decided`, `verification_completed`, `output_written`, `case_failed`.
+- `input_refs` không được `null` hoặc rỗng. Mọi event có `source_filename`, `input_case_id`, `order_id`
+  khi các giá trị này đọc được; lineage tích lũy thêm domain `task_id`/attempt, payload digest,
+  EvidenceBundle version/digest, Policy task và draft version/digest theo từng giai đoạn.
+- `agent_completed` tham chiếu task trong `input_refs`; digest của AgentResult thuộc
+  `output_summary`, không đảo lẫn input và output lineage.
 - Không ghi API key, secret, toàn bộ prompt hoặc dữ liệu CSV không cần thiết.
 - Trace phải đủ chứng minh mỗi case có domain analysis, Policy và Verifier riêng.
 

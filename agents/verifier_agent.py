@@ -136,8 +136,15 @@ class VerifierAgent:
         }
         expected_sellers = {row["seller_id"] for row in items if row.get("seller_id")}
         entities = draft.affected_entities
+        expected_entities = {
+            "order_ids": bundle.entity_candidates.order_ids[:5],
+            "item_ids": bundle.entity_candidates.item_ids[:5],
+            "seller_ids": bundle.entity_candidates.seller_ids[:5],
+            "payment_ids": bundle.entity_candidates.payment_ids[:5],
+        }
         entities_ok = (
-            set(entities.order_ids).issubset({task.order_id})
+            entities.model_dump(mode="json") == expected_entities
+            and set(entities.order_ids).issubset({task.order_id})
             and set(entities.item_ids).issubset(expected_item_ids)
             and set(entities.payment_ids).issubset(expected_payment_ids)
             and set(entities.seller_ids).issubset(expected_sellers)
@@ -174,6 +181,14 @@ class VerifierAgent:
             and Decimal(str(financial.freight_total_brl)) == recomputed["freight_total_brl"]
             and Decimal(str(financial.payment_total_brl)) == recomputed["payment_total_brl"]
         )
+        if not items:
+            financial_ok = (
+                financial_ok
+                and entities.item_ids == []
+                and entities.seller_ids == []
+                and financial.item_total_brl == 0.0
+                and financial.freight_total_brl == 0.0
+            )
         if not financial_ok:
             checks["financials"] = False
             errors.append(
@@ -205,10 +220,14 @@ class VerifierAgent:
                 "ranked_causes": decision.ranked_causes == expected_decision.ranked_causes,
                 "responsible_parties": decision.responsible_parties
                 == expected_decision.responsible_parties,
+                "selected_entities": decision.selected_entities
+                == expected_decision.selected_entities,
                 "recommended_refund_brl": decision.recommended_refund_brl
                 == expected_decision.recommended_refund_brl,
                 "resolution_actions": decision.resolution_actions
                 == expected_decision.resolution_actions,
+                "selected_evidence_ids": decision.selected_evidence_ids
+                == expected_decision.selected_evidence_ids,
                 "draft": (
                     draft.assessment.primary_issue == decision.primary_issue
                     and draft.assessment.case_status == decision.case_status
@@ -253,6 +272,7 @@ class VerifierAgent:
             and len(draft.root_cause_analysis.ranked_causes) <= 3
             and len(draft.root_cause_analysis.responsible_parties) <= 3
             and len(draft.resolution_actions) <= 5
+            and 0 <= draft.assessment.confidence <= 1
         )
         if not limits_ok:
             checks["limits"] = False

@@ -236,7 +236,38 @@ class PolicyDecision(StrictModel):
             raise ValueError("selected evidence IDs must be unique")
         if len(self.resolution_actions) != len(set(self.resolution_actions)):
             raise ValueError("resolution actions must be unique")
+        self._validate_status_resolution(
+            self.case_status,
+            self.recommended_refund_brl,
+            self.resolution_actions,
+        )
         return self
+
+    @staticmethod
+    def _validate_status_resolution(
+        case_status: Literal["action_required", "no_action"],
+        refund: Decimal,
+        actions: list[ResolutionAction],
+    ) -> None:
+        refund_actions = {
+            ResolutionAction.ISSUE_FULL_REFUND,
+            ResolutionAction.REFUND_FREIGHT,
+        }
+        no_action_actions = {
+            ResolutionAction.EXPLAIN_VALID_SPLIT_PAYMENT,
+            ResolutionAction.REJECT_LATE_REFUND,
+        }
+        selected = set(actions)
+        if case_status == "action_required" and (
+            refund <= 0 or not selected or not selected.issubset(refund_actions)
+        ):
+            raise ValueError("action_required requires a positive refund and refund actions only")
+        if case_status == "no_action" and (
+            refund != 0 or not selected or not selected.issubset(no_action_actions)
+        ):
+            raise ValueError(
+                "no_action requires zero refund and explanation/rejection actions only"
+            )
 
 
 class Assessment(StrictModel):
@@ -287,6 +318,15 @@ class FinalOutput(StrictModel):
         if len(values) != len(set(values)):
             raise ValueError("evidence IDs must be unique")
         return values
+
+    @model_validator(mode="after")
+    def validate_status_resolution(self) -> FinalOutput:
+        PolicyDecision._validate_status_resolution(
+            self.assessment.case_status,
+            Decimal(str(self.financial_resolution.recommended_refund_brl)),
+            self.resolution_actions,
+        )
+        return self
 
 
 class VerificationResult(StrictModel):
@@ -837,6 +877,8 @@ class CoordinatorAgent:
             output_summary={
                 "primary_issue": decision.primary_issue.value,
                 "matched_rule_priority": decision.matched_rule_priority,
+                "confidence": decision.confidence,
+                "confidence_basis": decision.confidence_basis,
             },
             handoff_to="draft",
         )
@@ -927,6 +969,13 @@ class CoordinatorAgent:
             {**state, **update},
             "verification_completed",
             "success" if verification.verdict == "PASS" else "failed",
+            input_refs={
+                "agent": AgentName.VERIFIER.value,
+                "task_id": result.task_id,
+                "attempt": result.attempt,
+                "draft_version": state["draft_version"],
+                "draft_digest": state["draft_digest"],
+            },
             output_summary={
                 "verdict": verification.verdict,
                 "draft_version": verification.draft_version,
@@ -1036,7 +1085,12 @@ class CoordinatorAgent:
                 state,
                 "task_dispatched",
                 "success",
-                input_refs={"task_id": task.task_id, "attempt": attempt},
+                input_refs={
+                    "agent": agent_name.value,
+                    "task_id": task.task_id,
+                    "attempt": attempt,
+                    "payload_digest": _canonical_digest(payload),
+                },
                 handoff_to=agent_name.value,
             )
             started = time.perf_counter()
@@ -1082,10 +1136,15 @@ class CoordinatorAgent:
                     state,
                     "agent_completed",
                     result.status.value,
-                    output_summary={
+                    input_refs={
                         "agent": agent_name.value,
                         "task_id": task.task_id,
                         "attempt": attempt,
+                        "payload_digest": _canonical_digest(payload),
+                    },
+                    output_summary={
+                        "agent": agent_name.value,
+                        "result_digest": _canonical_digest(result.model_dump(mode="json")),
                         "duration_ms": elapsed_ms,
                         "error_codes": [error.code for error in result.errors],
                         "api_models": sorted(
@@ -1111,6 +1170,12 @@ class CoordinatorAgent:
                 state,
                 "agent_retry_scheduled",
                 "retry",
+                input_refs={
+                    "agent": agent_name.value,
+                    "task_id": task.task_id,
+                    "attempt": attempt,
+                    "payload_digest": _canonical_digest(payload),
+                },
                 output_summary={
                     "agent": agent_name.value,
                     "next_attempt": attempt + 1,
@@ -1242,8 +1307,13 @@ class CoordinatorAgent:
         decision = state["policy_decision"]
         bundle = state["bundle"]
         self._validate_policy_selections(decision, bundle)
-        item_total = _money_float(bundle.item_seller_facts["item_total_brl"])
-        freight_total = _money_float(bundle.item_seller_facts["freight_total_brl"])
+        has_item_rows = bool(bundle.item_seller_facts.get("items"))
+        item_total = (
+            _money_float(bundle.item_seller_facts["item_total_brl"]) if has_item_rows else 0.0
+        )
+        freight_total = (
+            _money_float(bundle.item_seller_facts["freight_total_brl"]) if has_item_rows else 0.0
+        )
         payment_total = _money_float(bundle.payment_facts["payment_total_brl"])
         refund = _money_float(decision.recommended_refund_brl)
         return FinalOutput(
@@ -1253,8 +1323,11 @@ class CoordinatorAgent:
                 case_status=decision.case_status,
                 confidence=decision.confidence,
             ),
-            affected_entities=AffectedEntities.model_validate(
-                decision.selected_entities.model_dump()
+            affected_entities=AffectedEntities(
+                order_ids=decision.selected_entities.order_ids,
+                item_ids=decision.selected_entities.item_ids if has_item_rows else [],
+                seller_ids=decision.selected_entities.seller_ids if has_item_rows else [],
+                payment_ids=decision.selected_entities.payment_ids,
             ),
             root_cause_analysis=RootCauseAnalysis(
                 ranked_causes=decision.ranked_causes,
@@ -1273,15 +1346,15 @@ class CoordinatorAgent:
 
     def _validate_policy_selections(self, decision: PolicyDecision, bundle: EvidenceBundle) -> None:
         for field_name in ("order_ids", "item_ids", "seller_ids", "payment_ids"):
-            selected = set(getattr(decision.selected_entities, field_name))
-            candidates = set(getattr(bundle.entity_candidates, field_name))
-            if not selected.issubset(candidates):
+            selected = getattr(decision.selected_entities, field_name)
+            expected = getattr(bundle.entity_candidates, field_name)[:5]
+            if selected != expected:
                 raise CoordinationFailure(
                     [
                         AgentError(
-                            code="INVALID_ENTITY_SELECTION",
+                            code="INCOMPLETE_ENTITY_SELECTION",
                             path=f"selected_entities.{field_name}",
-                            message="policy selected an entity absent from the evidence bundle",
+                            message="policy must select every expected entity ID in stable order",
                             source=AgentName.POLICY.value,
                             retryable=True,
                             retry_target=AgentName.POLICY,
@@ -1345,6 +1418,8 @@ class CoordinatorAgent:
             return
         case_value = state.get("case")
         case = case_value if isinstance(case_value, CaseInput) else None
+        resolved_input_refs = self._lineage_refs(state)
+        resolved_input_refs.update(dict(input_refs or {}))
         event = {
             "timestamp": self._clock().isoformat(),
             "run_id": state["run_id"],
@@ -1354,11 +1429,64 @@ class CoordinatorAgent:
             "event_type": event_type,
             "status": status,
             "phase": str(state.get("phase", CoordinatorPhase.RECEIVED)),
-            "input_refs": dict(input_refs or {}),
+            "input_refs": resolved_input_refs,
             "output_summary": dict(output_summary or {}),
             "handoff_to": handoff_to,
         }
         await _maybe_await(self._trace_sink.emit(event))
+
+    @staticmethod
+    def _lineage_refs(state: Mapping[str, Any]) -> dict[str, Any]:
+        refs: dict[str, Any] = {}
+        source_filename = state.get("source_filename")
+        if isinstance(source_filename, str) and source_filename:
+            refs["source_filename"] = Path(source_filename).name
+
+        case_value = state.get("case")
+        if isinstance(case_value, CaseInput):
+            refs["input_case_id"] = case_value.case_id
+            refs["order_id"] = case_value.customer_request.claimed_order_id
+        else:
+            raw_case = state.get("raw_case")
+            if isinstance(raw_case, Mapping):
+                raw_case_id = raw_case.get("case_id")
+                if isinstance(raw_case_id, str) and raw_case_id:
+                    refs["input_case_id"] = raw_case_id
+                customer_request = raw_case.get("customer_request")
+                if isinstance(customer_request, Mapping):
+                    order_id = customer_request.get("claimed_order_id")
+                    if isinstance(order_id, str) and order_id:
+                        refs["order_id"] = order_id
+
+        domain_results = state.get("domain_results")
+        if isinstance(domain_results, Mapping):
+            domain_tasks = {
+                str(name): {"task_id": result.task_id, "attempt": result.attempt}
+                for name, result in domain_results.items()
+                if isinstance(result, AgentResult)
+            }
+            if domain_tasks:
+                refs["domain_tasks"] = domain_tasks
+
+        bundle = state.get("bundle")
+        if isinstance(bundle, EvidenceBundle):
+            refs["evidence_bundle"] = {
+                "version": bundle.bundle_version,
+                "digest": bundle.bundle_digest,
+            }
+
+        policy_result = state.get("policy_result")
+        if isinstance(policy_result, AgentResult):
+            refs["policy_task"] = {
+                "task_id": policy_result.task_id,
+                "attempt": policy_result.attempt,
+            }
+
+        draft_version = state.get("draft_version")
+        draft_digest = state.get("draft_digest")
+        if isinstance(draft_version, int) and isinstance(draft_digest, str):
+            refs["draft"] = {"version": draft_version, "digest": draft_digest}
+        return refs
 
     def _result_from_state(self, state: Mapping[str, Any]) -> CoordinatorResult:
         phase = state.get("phase", CoordinatorPhase.FAILED)

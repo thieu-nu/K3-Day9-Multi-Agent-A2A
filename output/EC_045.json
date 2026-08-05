@@ -3,14 +3,18 @@
   "assessment": {
     "primary_issue": "canceled_order_paid",
     "case_status": "action_required",
-    "confidence": 1.0
+    "confidence": 0.95
   },
   "affected_entities": {
-    "order_ids": [],
+    "order_ids": [
+      "d67b79fea59821fda4d363d337a56c3a"
+    ],
     "item_ids": [
       "d67b79fea59821fda4d363d337a56c3a:1"
     ],
-    "seller_ids": [],
+    "seller_ids": [
+      "5a8e7d5003a1f221f9e1d6e411de7c23"
+    ],
     "payment_ids": [
       "d67b79fea59821fda4d363d337a56c3a:1"
     ]
